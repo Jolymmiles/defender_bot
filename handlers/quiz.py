@@ -17,38 +17,76 @@ from database import (
 from utils.moderation import ban_user_after_timeout
 from utils.message_utils import delete_message
 from .states import UserState
+from .language import get_user_language
 
 
 async def group_message_handler(
-    update: types.ChatMemberUpdated,
+    message: types.Message,
     state: FSMContext,
     bot: Bot,
     pool: PoolType,
     **kwargs,
 ) -> None:
-    """Обработка новых участников."""
-    if update.chat.id != config.ALLOWED_CHAT_ID or update.new_chat_member.user.is_bot:
+    """Обработка первого сообщения пользователя в группе."""
+    if message.chat.id != config.ALLOWED_CHAT_ID or message.from_user.is_bot:
         return
 
-    user = update.new_chat_member.user
-    if (
-        update.old_chat_member.status not in ("left", "kicked")
-        or update.new_chat_member.status != "member"
-        or await check_user_passed(pool, user.id)
-        or await check_user_banned(pool, user.id)
-    ):
+    user = message.from_user
+    passed = await check_user_passed(pool, user.id)
+    banned = await check_user_banned(pool, user.id)
+    
+    # Если пользователь уже прошел квиз или забанен - пропускаем
+    if passed or banned:
         return
-
-    from .language import language_selection_handler
-
-    message = types.Message(
-        message_id=0,
-        chat=update.chat,
-        from_user=user,
-        date=update.date,
+    
+    # Получаем состояние пользователя
+    user_state = await state.get_state()
+    
+    # Если это уже не первое сообщение - удаляем
+    if user_state is not None:
+        await delete_message(bot, message.chat.id, message.message_id, delay=0)
+        return
+    
+    lang = get_user_language(user)
+    thread_id = message.message_thread_id
+    
+    await state.update_data(
+        language=lang,
+        thread_id=thread_id,
+        group_chat_id=message.chat.id,
+        first_message_id=message.message_id,
     )
-    await state.update_data(first_message_id=message.message_id)
-    await language_selection_handler(message, state, bot=bot, pool=pool)
+    
+    await state.set_state(UserState.answering_quiz)
+    
+    button_text = dialogs["quiz_button"][lang]
+    instruction_text = dialogs["quiz_instruction"][lang]
+    
+    logging.info(f"First message from user {user.id} in group {message.chat.id}")
+
+    bot_username = (await bot.get_me()).username
+    user_mention = user.mention_html()
+    greeting_text = f"{user_mention}, {instruction_text}"
+    
+    quiz_button_msg = await bot.send_message(
+        chat_id=message.chat.id,
+        text=greeting_text,
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text=button_text,
+                        url=f"https://t.me/{bot_username}?start=quiz_{user.id}_{lang}_{message.chat.id}",
+                    )
+                ]
+            ]
+        ),
+        reply_parameters=types.ReplyParameters(message_id=message.message_id),
+        message_thread_id=thread_id,
+    )
+
+    await state.update_data(bot_messages=[quiz_button_msg.message_id])
 
 
 async def poll_answer_handler(
@@ -211,14 +249,17 @@ async def poll_handler(
 
     if not user_data.get("has_answered", False):
         lang = user_data.get("language", "en")
+        user_link = f'<a href="tg://user?id={user_id}">{user_id}</a>'
         combined_message = (
-            f"⏰ {dialogs['timeout'][lang].format(name=f'<a href=\"tg://user?id={user_id}\">{user_id}</a>')} "
+            f"⏰ {dialogs['timeout'][lang].format(name=user_link)} "
             f"{dialogs['blocked_message'][lang]}"
         )
+        first_message_id = user_data.get("first_message_id")
         timeout_msg = await bot.send_message(
             chat_id,
             combined_message,
             parse_mode="HTML",
+            reply_parameters=types.ReplyParameters(message_id=first_message_id) if first_message_id else None,
         )
         group_chat_id = user_data.get("group_chat_id")
         first_message_id = user_data.get("first_message_id")
